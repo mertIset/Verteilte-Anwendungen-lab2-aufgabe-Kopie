@@ -23,15 +23,18 @@ import jakarta.enterprise.event.ObservesAsync;
 import jakarta.inject.Inject;
 import jakarta.json.bind.Jsonb;
 import jakarta.json.bind.JsonbBuilder;
+import jakarta.websocket.OnClose;
+import jakarta.websocket.OnMessage;
+import jakarta.websocket.OnOpen;
 import jakarta.websocket.Session;
+import jakarta.websocket.server.ServerEndpoint;
 
+@ServerEndpoint("/quotes")  // <-- WICHTIG: Definiert den WebSocket-Pfad
 @ApplicationScoped
 public class WebsocketServer {
 
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
-
     private final Map<String, Subscription> subs = new ConcurrentHashMap<>();
-
     private final Jsonb jsonb = JsonbBuilder.create();
 
     @Inject
@@ -49,8 +52,69 @@ public class WebsocketServer {
     @Inject
     Logger logger;
 
-    // TODO: IMPLEMENTIEREN SIE DIE METHODEN FÜR DEN WEBSOCKET-SERVER
+    // METHODE 1: Wird aufgerufen, wenn ein Client sich verbindet
+    @OnOpen
+    public void onOpen(Session session) {
+        logger.infov("WebSocket-Verbindung geöffnet: {0}", session.getId());
+        sessions.put(session.getId(), session);
+        // Erstelle eine leere Subscription-Map für diese Session
+        subs.put(session.getId(), new Subscription());
+    }
 
+    // METHODE 2: Wird aufgerufen, wenn ein Client eine Nachricht sendet
+    @OnMessage
+    public void onMessage(String message, Session session) {
+        logger.infov("Nachricht empfangen von {0}: {1}", session.getId(), message);
+
+        try {
+            // Versuche die Nachricht als Ping zu parsen
+            var pingMsg = jsonb.fromJson(message, Map.class);
+            if ("ping".equals(pingMsg.get("type"))) {
+                // Sende Pong zurück
+                sendJson(session, new WsMsgs.Pong());
+                return;
+            }
+        } catch (Exception e) {
+            // Kein Ping, weiter mit normaler Verarbeitung
+        }
+
+        try {
+            // Parse die Nachricht als Subscribe/Unsubscribe
+            WsMsgs.Sub sub = jsonb.fromJson(message, WsMsgs.Sub.class);
+
+            if ("subscribe".equals(sub.action)) {
+                logger.infov("Subscribe-Anfrage: {0}:{1}:{2}",
+                        sub.symbolId, sub.venueId, sub.channel);
+                subscribe(sub, session);
+            } else if ("unsubscribe".equals(sub.action)) {
+                logger.infov("Unsubscribe-Anfrage: {0}:{1}:{2}",
+                        sub.symbolId, sub.venueId, sub.channel);
+                unsubscribe(sub, session);
+            }
+        } catch (Exception e) {
+            logger.errorv(e, "Fehler beim Verarbeiten der Nachricht");
+            sendJson(session, Map.of("type", "error",
+                    "message", "Ungültige Nachricht: " + e.getMessage()));
+        }
+    }
+
+    // METHODE 3: Wird aufgerufen, wenn ein Client die Verbindung trennt
+    @OnClose
+    public void onClose(Session session) {
+        logger.infov("WebSocket-Verbindung geschlossen: {0}", session.getId());
+
+        // Entferne alle Subscriptions dieser Session
+        Subscription subscription = subs.remove(session.getId());
+        if (subscription != null) {
+            for (SymbolKey key : subscription.windows.keySet()) {
+                unsubEvent.fire(new UnsubEvent(key));
+            }
+        }
+
+        sessions.remove(session.getId());
+    }
+
+    // Die restlichen Methoden sind bereits vorhanden...
     void unsubscribe(WsMsgs.Sub sub, Session session) {
         SymbolKey key = toKey(sub);
         if (key == null)
@@ -84,6 +148,7 @@ public class WebsocketServer {
         }
         var payload = Map.of("type", "candles", "key", key, "data", list);
         sendJson(session, payload);
+
         var quoteList = simpleQuoteConsumer.getQuotes(key, Duration.ofSeconds(windowSecs));
         if (quoteList == null || quoteList.isEmpty()) {
             var lastKnownQuote = simpleQuoteConsumer.getLastKnown(key);
@@ -93,8 +158,7 @@ public class WebsocketServer {
                 quoteList = List.of();
             }
         }
-        var quotePayload = Map.of("type", "quotes", "key", key,
-                "data", quoteList);
+        var quotePayload = Map.of("type", "quotes", "key", key, "data", quoteList);
         sendJson(session, quotePayload);
     }
 
@@ -156,10 +220,11 @@ public class WebsocketServer {
             return;
         try {
             String json = jsonb.toJson(obj);
-            logger.infov("Sending JSON over WebSocket: {0}", json);
-            // TODO: Senden Sie die JSON-Nachricht an den Client über die WebSocket-Session
+            logger.infov("Sende JSON über WebSocket: {0}", json);
+            // WICHTIG: Hier die Nachricht tatsächlich senden!
+            session.getAsyncRemote().sendText(json);
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.errorv(e, "Fehler beim Senden der JSON-Nachricht");
         }
     }
 }
